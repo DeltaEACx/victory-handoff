@@ -162,7 +162,12 @@ pub fn run(
     let paths = crate::default_paths(paths)?;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
-    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
+    let wave_override = std::env::var("VICTORY_HOST_MAX_WAVE")
+        .ok()
+        .map(|v| v.parse::<u32>())
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("VICTORY_HOST_MAX_WAVE must be an unsigned lane count"))?;
+    if let Some(n) = wave_override {
         victory_shader::emit::set_host_max_wave(n);
     }
     let dll = validate.then(Validator::default_path).flatten();
@@ -175,7 +180,14 @@ pub fn run(
         );
     }
     if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
+        let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        let (adapter, min, max) = host.wave_target().map_err(anyhow::Error::msg)?;
+        println!("pipeline GPU {adapter}, wave lanes {min}..{max}");
+        if wave_override.is_none() {
+            victory_shader::emit::set_host_max_wave(max);
+        } else {
+            println!("wave target  {} (explicit override; pipeline checks still use the above GPU)", wave_override.unwrap());
+        }
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()

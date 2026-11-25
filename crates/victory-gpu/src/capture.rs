@@ -8,6 +8,24 @@ use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+/// Narrow packed-light capture offsets after the first heavy frame.
+/// Frame zero cannot be captured: it is recognized at its present.
+fn packed_light_offsets() -> &'static [u64] {
+    static OFFSETS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    OFFSETS.get_or_init(|| {
+        std::env::var("VICTORY_PACKED_LIGHT_AFTER")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|n| n.trim().parse().ok().filter(|&n| (1..=65_535).contains(&n)))
+            .take(3)
+            .collect()
+    })
+}
+
+fn relative_frame(first: u64, frame: u64, offsets: &[u64]) -> bool {
+    frame.checked_sub(first).is_some_and(|offset| offset != 0 && offsets.contains(&offset))
+}
+
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
@@ -19,6 +37,10 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
+    let packed = packed_light_offsets();
+    if !packed.is_empty() {
+        return relative_frame(WORLD.load(std::sync::atomic::Ordering::Relaxed), n, packed);
+    }
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let named = LIST
         .get_or_init(|| {
@@ -128,10 +150,15 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
-    if world_on()
+    if (world_on() || !packed_light_offsets().is_empty())
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
     {
+        let packed = packed_light_offsets();
+        if !packed.is_empty() {
+            tracing::info!(frame, after = ?packed, "packed-light capture offsets from the first frame of 500 draws or more");
+            return;
+        }
         tracing::info!(frame, "the first frame of 500 draws or more: frames {} and {} are captured", frame + 2, frame + 6);
         #[cfg(feature = "diagnostics")]
         if let Some(folder) = folder() {
@@ -144,6 +171,9 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
+    if !packed_light_offsets().is_empty() {
+        return folder().is_some() && listed(n);
+    }
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
     let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
@@ -344,9 +374,52 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// For a listed frame, keep the two ends of a packed-light alias copy so
+/// zero light at the writer can be distinguished from loss in the copy.
+pub(crate) fn note_packed_light_alias(
+    source: crate::object::This,
+    placed: crate::object::This,
+    from: &ID3D12Resource,
+    to: &ID3D12Resource,
+) {
+    let frame = crate::queue::presented() + 1;
+    if !dump_on() || !listed(frame) {
+        return;
+    }
+    // SAFETY: alias recording passes live textures.
+    let formats = unsafe { (from.GetDesc().Format.0, to.GetDesc().Format.0) };
+    if formats != (42, 67) {
+        return;
+    }
+    // A read may recur in many lists; retain and report each pair once,
+    // with a bound on the extra end-of-frame GPU readbacks.
+    static PAIRS: std::sync::Mutex<(u64, Vec<(usize, usize)>)> =
+        std::sync::Mutex::new((0, Vec::new()));
+    let mut pairs = PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+    if pairs.0 != frame {
+        *pairs = (frame, Vec::new());
+    }
+    let pair = (source as usize, placed as usize);
+    if pairs.1.len() == 8 || pairs.1.contains(&pair) {
+        return;
+    }
+    pairs.1.push(pair);
+    drop(pairs);
+    keep_target(source);
+    keep_target(placed);
+    tracing::info!(frame, ?source, ?placed, "packed light writer and sampled alias selected for capture");
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if !dump_on() || !packed_light_offsets().is_empty() || !listed(crate::queue::presented() + 1) {
+        return;
+    }
+    keep_target(resource);
+}
+
+fn keep_target(resource: crate::object::This) {
+    if resource.is_null() {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
@@ -361,6 +434,9 @@ pub(crate) fn note_target(resource: crate::object::This) {
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    if !packed_light_offsets().is_empty() {
+        tracing::info!(frame, targets = targets.len(), "packed-light frame: retained writer/alias resources");
+    }
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
@@ -420,11 +496,24 @@ fn dump_one(
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished; the mapping spans the footprint's rows.
     unsafe {
+        let Ok(len) = usize::try_from(buffer.GetDesc().Width) else { return };
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        // The last row need not include the full pitch's padding.
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
+        if matches!(f.Format.0, 42 | 67)
+            && let Some(light) = packed_light_stats(rows, f.Width as usize, f.Height as usize, pitch)
+        {
+            tracing::info!(
+                frame, ?resource, format = f.Format.0,
+                width = f.Width, height = f.Height,
+                words_set = light.words_set, rgb_set = light.rgb_set, peak_rgb = ?light.peak_rgb,
+                word_fingerprint = format_args!("{:016x}", light.word_fingerprint),
+                "target values interpreted as RGB9E5 packed light"
+            );
+        }
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.
         if matches!(d.Format.0, 44..=47) {
@@ -540,6 +629,48 @@ fn small_float(bits: u32, man: u32) -> f32 {
     }
 }
 
+/// DXGI R9G9B9E5_SHAREDEXP: exponent-only words still decode to black.
+fn packed_light(word: u32) -> [f32; 3] {
+    let scale = 2f32.powi((word >> 27) as i32 - 24);
+    [0, 9, 18].map(|shift| ((word >> shift) & 0x1ff) as f32 * scale)
+}
+
+#[derive(Default, Debug, PartialEq)]
+struct PackedLightStats {
+    words_set: usize,
+    rgb_set: usize,
+    peak_rgb: [f32; 3],
+    word_fingerprint: u64,
+}
+
+fn packed_light_stats(rows: &[u8], w: usize, h: usize, pitch: usize) -> Option<PackedLightStats> {
+    let width = w.checked_mul(4)?;
+    let extent = h.checked_sub(1)?.checked_mul(pitch)?.checked_add(width)?;
+    if width == 0 || width > pitch || extent > rows.len() {
+        return None;
+    }
+    let mut stats = PackedLightStats {
+        word_fingerprint: 0xcbf2_9ce4_8422_2325,
+        ..PackedLightStats::default()
+    };
+    for y in 0..h {
+        let start = y * pitch;
+        for pixel in rows[start..start + width].chunks_exact(4) {
+            let word = u32::from_le_bytes(pixel.try_into().expect("four bytes"));
+            stats.word_fingerprint =
+                (stats.word_fingerprint ^ u64::from(word)).wrapping_mul(0x100_0000_01b3);
+            stats.words_set += usize::from(word != 0);
+            if word & 0x07ff_ffff != 0 {
+                stats.rgb_set += 1;
+                for (peak, c) in stats.peak_rgb.iter_mut().zip(packed_light(word)) {
+                    *peak = peak.max(c);
+                }
+            }
+        }
+    }
+    Some(stats)
+}
+
 /// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
 /// as channel values scaled so the largest finite one is white (single
 /// channels: lowest black, highest white, as grey). `None` for formats not
@@ -579,6 +710,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             let v = u32_at(b, 0);
             [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)]
         })),
+        67 => (4, Box::new(move |b| packed_light(u32_at(b, 0)))),
         9..=10 => (8, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))])),
         11..=14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i))))),
         33..=34 => (4, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0])),
@@ -630,24 +762,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             }
         }
     }
-    // R32_UINT targets hold packed light (the title reads them back as
-    // R9G9B9E5): as floats their low, high and share above the lowest say
-    // nothing. How many texels hold any bit, and the highest channel value
-    // of the packed reading.
+    // Some R32_UINT targets are tables, not packed light.
     if format == 42 {
-        let (mut set, mut packed_high) = (0usize, 0f32);
-        for y in 0..h {
-            for x in 0..w {
-                let v = u32_at(px(x, y, 4), 0);
-                set += usize::from(v != 0);
-                let scale = 2f32.powi((v >> 27) as i32 - 24);
-                for k in 0..3 {
-                    packed_high = packed_high.max((v >> (9 * k) & 0x1ff) as f32 * scale);
-                }
-            }
-        }
-        let nonzero_bits_percent = set as f32 * 100.0 / (w * h).max(1) as f32;
-        tracing::info!(format, nonzero_bits_percent, packed_high, "target values as packed light");
         // The same words as plain numbers, by class. Tables of indices and
         // masks say nothing as floats or as packed light: in the title's
         // shadow-mask table 0 is a block in full shadow, a word up to 255
@@ -687,7 +803,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     }
     // Float colours (scene light) go through a cube root: scaled linearly,
     // a night scene under one lamp of 50 units came out all black.
-    let curved = matches!(format, 1..=2 | 9..=10 | 26);
+    let curved = matches!(format, 1..=2 | 9..=10 | 26 | 67);
     for v in values {
         let c = v.map(|c| {
             let t = ((c - low) / range).clamp(0.0, 1.0);
@@ -703,6 +819,12 @@ const GRID: u32 = 4;
 /// Bytes between the grid's pixels in the readback buffer (placement
 /// alignment).
 const SLOT: u64 = 512;
+
+/// Benchmark runs can opt out of the per-present diagnostic readback.
+pub(crate) fn probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_PROBE").is_none_or(|v| v != "0"))
+}
 
 /// Records copies of a grid of pixels of `texture` (8-bit color, in the
 /// copy-source state) into a readback buffer, to tell black frames.
@@ -789,28 +911,71 @@ pub(crate) fn probe(
     }
 }
 
-/// Whether every pixel [`probe`] read is (near) black.
-pub(crate) fn black(buffer: &ID3D12Resource) -> bool {
+#[derive(Clone, Copy)]
+struct FrameSample {
+    frame: u64,
+    level: u8,
+    rgb: [u8; GRID as usize * GRID as usize * 3],
+}
+
+#[derive(Default)]
+struct FrameHistory {
+    previous: Option<FrameSample>,
+    before: Option<FrameSample>,
+    reappearances: u32,
+}
+
+impl FrameHistory {
+    /// A visible A/B/A at three consecutive presents. Merely having a
+    /// similar brightness or one missing readback is not a match.
+    fn push(&mut self, sample: FrameSample) -> bool {
+        let repeat = self.before.zip(self.previous).is_some_and(|(a, b)| {
+            a.frame.checked_add(1) == Some(b.frame)
+                && b.frame.checked_add(1) == Some(sample.frame)
+                && a.level >= 8
+                && b.level >= 8
+                && sample.rgb == a.rgb
+                && sample.rgb != b.rgb
+        });
+        self.before = self.previous.replace(sample);
+        if repeat {
+            self.reappearances = self.reappearances.saturating_add(1);
+        }
+        repeat && self.reappearances <= 16
+    }
+}
+
+/// Whether every pixel [`probe`] read is (near) black. The same grid also
+/// checks for a recently seen sample reappearing, without extra GPU work.
+pub(crate) fn black(frame: u64, buffer: &ID3D12Resource) -> Option<bool> {
+    static HISTORY: std::sync::Mutex<FrameHistory> = std::sync::Mutex::new(FrameHistory {
+        previous: None, before: None, reappearances: 0,
+    });
     let mut data = std::ptr::null_mut();
     // SAFETY: the copies finished (every submission is waited for).
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return false;
+            return None;
         }
         let bytes =
             std::slice::from_raw_parts(data.cast::<u8>(), (SLOT * u64::from(GRID * GRID)) as usize);
-        let level = bytes
-            .chunks(SLOT as usize)
-            .flat_map(|pixel| pixel[..3].iter().copied())
-            .max()
-            .unwrap_or(0);
+        let mut rgb = [0; GRID as usize * GRID as usize * 3];
+        for (pixel, dst) in bytes.chunks_exact(SLOT as usize).zip(rgb.chunks_exact_mut(3)) {
+            dst.copy_from_slice(&pixel[..3]);
+        }
         buffer.Unmap(0, None);
+        let level = rgb.into_iter().max().unwrap_or(0);
+        let mut history = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+        if history.push(FrameSample { frame, level, rgb }) {
+            tracing::info!(frame, earlier_frame = frame - 2, level, "present RGB grid repeats after an intervening different frame");
+        }
+        drop(history);
         let mut levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
         if levels.len() == 12 {
             levels.pop_front();
         }
         levels.push_back(level);
-        level < 8
+        Some(level < 8)
     }
 }
 
@@ -827,8 +992,64 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn relative_packed_light_frames_follow_world_start_without_adding_frames() {
+        let selected = super::relative_frame;
+        let offsets = [1, 3, 7];
+        assert!(!selected(u64::MAX, 705, &offsets));
+        assert!(!selected(1230, 1229, &offsets));
+        assert!(!selected(1230, 1230, &offsets));
+        assert!(selected(1230, 1231, &offsets));
+        assert!(!selected(1230, 1232, &offsets));
+        assert!(selected(1230, 1233, &offsets));
+        assert!(selected(1435, 1442, &offsets));
+        assert!(!selected(1435, 1443, &offsets));
+    }
+
+    #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    #[test]
+    fn frame_grid_reappearance_requires_three_adjacent_visible_presents() {
+        let sample = |frame, color, level| super::FrameSample {
+            frame, level, rgb: [color; super::GRID as usize * super::GRID as usize * 3],
+        };
+        let mut history = super::FrameHistory::default();
+        assert!(!history.push(sample(1, 12, 12)));
+        assert!(!history.push(sample(2, 21, 21)));
+        assert!(history.push(sample(3, 12, 12)));
+        assert!(!history.push(sample(5, 21, 21))); // missing sample at 4
+        assert!(!history.push(sample(6, 12, 12)));
+        assert!(!history.push(sample(7, 12, 12))); // static frame
+        assert!(!history.push(sample(8, 0, 0))); // ordinary black transitions are separate
+        assert!(!history.push(sample(9, 12, 12)));
+    }
+
+    #[test]
+    fn packed_light_decodes_channels_and_distinguishes_exponent_only_words() {
+        let color: u32 = (24 << 27) | (27 << 18) | (8 << 9) | 1;
+        let exponent_only: u32 = 31 << 27;
+        assert_eq!(super::packed_light(color), [1.0, 8.0, 27.0]);
+        assert_eq!(super::packed_light(exponent_only), [0.0; 3]);
+        assert_eq!(super::packed_light(1), [2f32.powi(-24), 0.0, 0.0]);
+        let words = [color.to_le_bytes(), [0xff; 4], exponent_only.to_le_bytes()].concat();
+        // Two one-pixel rows; the four intervening bytes are padding.
+        let stats = super::packed_light_stats(&words, 1, 2, 8).unwrap();
+        assert_eq!((stats.words_set, stats.rgb_set, stats.peak_rgb), (2, 1, [1.0, 8.0, 27.0]));
+        let tight = [color.to_le_bytes(), exponent_only.to_le_bytes()].concat();
+        assert_eq!(super::packed_light_stats(&tight, 1, 2, 4), Some(stats));
+        assert_ne!(
+            super::packed_light_stats(&[exponent_only.to_le_bytes(), color.to_le_bytes()].concat(), 1, 2, 4)
+                .unwrap().word_fingerprint,
+            super::packed_light_stats(&tight, 1, 2, 4).unwrap().word_fingerprint,
+        );
+        assert_eq!(super::packed_light_stats(&words[..11], 1, 2, 8), None);
+        let preview = super::to_rgba(67, 1, 2, 8, &words).unwrap();
+        for (actual, expected) in preview[..3].iter().zip([85, 170, 255]) {
+            assert!(actual.abs_diff(expected) <= 1);
+        }
+        assert_eq!(&preview[3..], &[255, 0, 0, 0, 255]);
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,

@@ -58,6 +58,11 @@ fn build() -> &'static [u8; 32] {
                 // a translation cached without the clamp must not be served.
                 crate::descriptor::host::probe_view_limit();
                 bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
+                append_wave_target(
+                    &mut bytes,
+                    victory_shader::emit::host_max_wave(),
+                    std::env::var_os("VICTORY_WAVE_LOCAL").as_deref(),
+                );
                 // Which group barriers wait is part of the translation too.
                 bytes.push(victory_shader::emit::group_sync());
                 // So are the switches that pick the form of a wave64 program:
@@ -91,6 +96,21 @@ fn build() -> &'static [u8; 32] {
             }
         }
     })
+}
+
+/// A maximum-64 device's fixed WaveSize(64) bytecode is not valid on a
+/// maximum-32 device. Also separate exact (`idiom`) and approximate local
+/// wave fallback settings, even when using the same executable.
+fn append_wave_target(bytes: &mut Vec<u8>, max_wave: u32, local: Option<&std::ffi::OsStr>) {
+    bytes.extend_from_slice(b"wave-target-v1\0");
+    bytes.extend_from_slice(&max_wave.to_le_bytes());
+    // Distinguish an unset setting from an explicitly empty one.
+    bytes.push(u8::from(local.is_some()));
+    if let Some(local) = local {
+        let value = local.as_encoded_bytes();
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value);
+    }
 }
 
 /// The translation of a console shader container, from the cache when
@@ -332,6 +352,21 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wave_target_is_part_of_cache_identity() {
+        let key = |wave, local: Option<&str>| {
+            let mut bytes = b"same executable and shader".to_vec();
+            append_wave_target(&mut bytes, wave, local.map(std::ffi::OsStr::new));
+            *blake3::hash(&bytes).as_bytes()
+        };
+        assert_ne!(key(32, None), key(64, None));
+        assert_ne!(key(32, None), key(0, None));
+        assert_ne!(key(32, None), key(32, Some("idiom")));
+        assert_ne!(key(32, Some("0")), key(32, Some("idiom")));
+        assert_ne!(key(32, None), key(32, Some("")));
+        assert_eq!(key(32, Some("idiom")), key(32, Some("idiom")));
+    }
 
     fn shader() -> HostShader {
         HostShader {

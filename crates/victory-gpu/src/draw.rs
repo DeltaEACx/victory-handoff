@@ -324,6 +324,10 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+/// Heap pass phases: view reconciliation, buffer refresh scheduling, then
+/// texture mapping, creation and staging.
+#[cfg(feature = "diagnostics")]
+pub(crate) static HEAP_PHASE_MICROS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1383,6 +1387,8 @@ impl State {
         }
         drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        #[cfg(feature = "diagnostics")]
+        let reconciled = started.elapsed();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1415,9 +1421,20 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        #[cfg(feature = "diagnostics")]
+        let refreshed = started.elapsed();
         self.heap_textures(list, heap, host);
+        let elapsed = started.elapsed();
+        #[cfg(feature = "diagnostics")]
+        for (counter, phase) in HEAP_PHASE_MICROS.iter().zip([
+            reconciled,
+            refreshed - reconciled,
+            elapsed - refreshed,
+        ]) {
+            counter.fetch_add(phase.as_micros() as u64, Ordering::Relaxed);
+        }
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
-        HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        HEAP_BUFFER_MICROS.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         // The first pass and every growth of the set by half.
         let seen = LOGGED.load(Ordering::Relaxed);

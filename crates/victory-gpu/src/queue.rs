@@ -7,6 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
+#[cfg(all(windows, feature = "diagnostics"))]
+mod present_trace;
+
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
         0x0ec870a6,
@@ -107,17 +110,19 @@ fn split() -> bool {
 #[cfg(windows)]
 pub(crate) fn cuts() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    waits() && split() && *ON.get_or_init(|| std::env::var_os("VICTORY_CUT_WAITS").is_none_or(|v| v != "0"))
+    waits()
+        && split()
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_CUT_WAITS").is_none_or(|v| v != "0"))
 }
 
-/// Whether a present runs what queues still hold (on by default: a wait
-/// is not kept across frames). `VICTORY_WAIT_FORCE=0` keeps it held: for
-/// finding out whether the title's waits reach across its presents; a
-/// wait nothing ever meets then stops the title for good.
+/// Legacy escape hatch for experiments: explicitly pass unmet waits at
+/// present. Normally a queue keeps its waits across presents; passing one
+/// discards the producer/consumer ordering it was meant to enforce.
+/// `VICTORY_WAIT_FORCE=1` restores the old behavior.
 #[cfg(windows)]
 fn forces() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_FORCE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_FORCE").is_some_and(|v| v == "1"))
 }
 
 /// A submission to a queue whose lists are cut at their waits ([`cuts`]).
@@ -301,18 +306,20 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
 }
 
 /// Runs what waiting queues hold as far as their fences have been reached
-/// (`all`: all of it), each queue's in the order it was given. Called
+/// (`all`: all of it), each queue's in the order it was given. Returns
+/// whether anything advanced (including a wait or signal). Called
 /// where a fence may have moved: after a signal and after a submission (a
 /// list's bottom-of-pipe write may be into a fence), never from inside
 /// one.
 #[cfg(windows)]
-pub(crate) fn release_held(all: bool) {
+pub(crate) fn release_held(all: bool) -> bool {
     // One caller at a time, so a queue's submissions keep their order.
     static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
-        return;
+        return false;
     }
     let _one = lock(&RELEASING);
+    let mut advanced = false;
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
@@ -361,10 +368,15 @@ pub(crate) fn release_held(all: bool) {
                         // each range shaders write compared once).
                         #[cfg(feature = "diagnostics")]
                         {
-                            let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
+                            let waits = held
+                                .iter()
+                                .take_while(|h| matches!(h, Held::Value(_)))
+                                .count();
                             if waits > 0
                                 && matches!(held.get(waits), Some(Held::Run(..)))
-                                && held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met()))
+                                && held[..waits]
+                                    .iter()
+                                    .all(|h| matches!(h, Held::Value(w) if w.met()))
                             {
                                 crate::copystat::add(crate::copystat::C::PartsTogether, 1);
                             }
@@ -417,9 +429,86 @@ pub(crate) fn release_held(all: bool) {
                 lock(&WAITING).retain(|&w| w != q);
             }
         }
+        advanced |= moved;
         if !moved {
             break;
         }
+    }
+    advanced
+}
+
+/// At present, finish producers that are ready before considering their
+/// consumers. The release walk already visits every queue to a fixed point:
+/// if a producer is later than a consumer in WAITING, the next pass sees
+/// the value/fence it wrote. A late flight may also make a value available
+/// only after settling, so alternate the release walk with settling until
+/// no queue moves. A genuinely unsatisfied head stays at the front of its
+/// queue; later work and signals on that queue cannot overtake it.
+#[cfg(windows)]
+fn drain_present(mut settle: impl FnMut()) {
+    loop {
+        let before = release_held(false);
+        settle();
+        let after = release_held(false);
+        if !before && !after {
+            break;
+        }
+    }
+    if forces() {
+        release_held(true);
+    }
+}
+
+/// Compact, address-free snapshot of queues still blocked at present. A
+/// producer that never submits can leave one held indefinitely; this makes
+/// that distinction visible without weakening the memory/fence ordering.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn blocked_present_summary() -> Vec<(u32, usize, &'static str)> {
+    let queues = lock(&WAITING).clone();
+    queues
+        .into_iter()
+        .filter_map(|q| {
+            let queue = unsafe { &*(q as *const Queue) };
+            let held = lock(&queue.held);
+            let reason = match held.first()? {
+                Held::Wait(fence, value)
+                    if crate::fence::completed(*fence as This) < *value => "fence",
+                Held::Value(wait) if !value_met(wait) => "memory",
+                _ => "ready",
+            };
+            Some((queue.kind, held.len(), reason))
+        })
+        .collect()
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn blocked_signature(blocked: &[(u32, usize, &'static str)]) -> u64 {
+    if blocked.is_empty() {
+        return 0;
+    }
+    // Stable, address-free FNV-style fingerprint. A reason or held-count
+    // change is reported even between the periodic frame samples.
+    blocked.iter().fold(0xcbf2_9ce4_8422_2325u64, |mut hash, &(kind, count, reason)| {
+        for part in [u64::from(kind), count as u64, match reason {
+            "fence" => 1,
+            "memory" => 2,
+            _ => 3,
+        }] {
+            hash ^= part;
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+        hash
+    })
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn report_blocked_present(frame: u64) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let blocked = blocked_present_summary();
+    let current = blocked_signature(&blocked);
+    let previous = LAST.swap(current, Ordering::Relaxed);
+    if current != previous || (current != 0 && frame % 128 == 0) {
+        tracing::info!(frame, ?blocked, "queues held across present");
     }
 }
 
@@ -536,7 +625,11 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             if !unmet.is_empty() {
                 static SEEN: AtomicU64 = AtomicU64::new(0);
                 if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
-                    tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
+                    tracing::info!(
+                        kind = queue(this).kind,
+                        ?unmet,
+                        "a submission is held for a memory value"
+                    );
                 }
                 lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
                 let mut waiting = lock(&WAITING);
@@ -595,6 +688,10 @@ pub(crate) struct Plane {
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if !this.is_null() && count != 0 && !lists.is_null() && present_trace::active() {
+        present_trace::execute(this as usize, _token, count, _flags);
+    }
     execute(this, count, lists);
 }
 /// Signal with sync settings for the top and bottom of the pipe; our
@@ -646,11 +743,21 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
         {
             static CALLS: AtomicU64 = AtomicU64::new(0);
             if CALLS.fetch_add(1, Ordering::Relaxed) < 8 {
-                tracing::info!(kind = queue(this).kind, now, value, "a queue is told to wait for a fence");
+                tracing::info!(
+                    kind = queue(this).kind,
+                    now,
+                    value,
+                    "a queue is told to wait for a fence"
+                );
             }
         }
         #[cfg(feature = "diagnostics")]
-        crate::capture::op(this as usize, || format!("WAIT queue kind {} for fence {fence:?} value {value} (now {now})", queue(this).kind));
+        crate::capture::op(this as usize, || {
+            format!(
+                "WAIT queue kind {} for fence {fence:?} value {value} (now {now})",
+                queue(this).kind
+            )
+        });
         let behind = {
             let mut held = lock(&queue(this).held);
             let behind = !held.is_empty() || now < value;
@@ -755,30 +862,33 @@ pub(crate) fn presented() -> u64 {
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
 extern "system" fn present(
-    _: This,
+    _this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
     #[cfg(all(windows, feature = "diagnostics"))]
+    let trace = present_trace::active().then(|| {
+        // SAFETY: a nonempty array names its first plane; null is tolerated.
+        let raw = (planes > 0)
+            .then(|| unsafe { plane_parameters.as_ref() })
+            .flatten()
+            .map(|p| p.token);
+        present_trace::at_entry(_this as usize, raw, planes)
+    });
+    #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
-    // Submissions sent to the card and not waited for are settled first,
-    // and what that frees runs in its own order, before anything is forced.
+    // Finish ready producers and their dependent work in queue order.
+    // Without late flights this remains nonblocking even for an unmet wait.
     #[cfg(windows)]
-    if crate::host::late() && !crate::host::late_free_present() {
-        crate::host::settle_for_present();
-        release_held(false);
-        crate::host::settle_for_present();
-    } else if crate::host::late() {
-        // The present is sent ahead too: what waits for a value a flight
-        // will write runs behind that flight, and nothing is settled here.
-        release_held(false);
-    }
-    // shortcut: what a queue still holds at a present runs now, whatever
-    // its fence: a wait is not kept across frames.
-    #[cfg(windows)]
-    release_held(forces());
+    drain_present(|| {
+        if crate::host::late() && !crate::host::late_free_present() {
+            crate::host::settle_for_present();
+        }
+    });
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(all(windows, feature = "diagnostics"))]
+    report_blocked_present(frame);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -815,13 +925,29 @@ extern "system" fn present(
         }
     }
     #[cfg(windows)]
-    if planes > 0
+    let first_plane = if planes > 0 {
+        // SAFETY: a nonempty array names its first plane; null is tolerated.
+        unsafe { plane_parameters.as_ref() }
+    } else {
+        None
+    };
+    #[cfg(windows)]
+    let resource = if let Some(plane) = first_plane
         // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
         && plane.count > 0
         && !plane.resources.is_null()
+    {
         // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
+        unsafe { *plane.resources }
+    } else {
+        std::ptr::null()
+    };
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(trace) = trace {
+        trace.report(frame, resource as usize, first_plane.map_or(0, |p| p.count));
+    }
+    #[cfg(windows)]
+    if !resource.is_null()
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
@@ -842,13 +968,19 @@ extern "system" fn present(
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
+fn new_black_transition(previous: Option<(u64, bool)>, frame: u64, black: Option<bool>) -> bool {
+    black == Some(true)
+        && previous.is_some_and(|(prev, was_black)| !was_black && prev.checked_add(1) == Some(frame))
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
 fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
-    static LAST: std::sync::Mutex<(bool, u64, u64)> = std::sync::Mutex::new((false, 0, 0));
+    static LAST: std::sync::Mutex<(Option<(u64, bool)>, u64, u64)> =
+        std::sync::Mutex::new((None, 0, 0));
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let drawn = crate::draw::drawn();
-    let black = shown.unwrap_or(false);
     let draws = crate::draw::take_frame();
-    if black && !last.0 {
+    if new_black_transition(last.0, frame, shown) {
         last.2 += 1;
         tracing::warn!(
             frame,
@@ -870,7 +1002,7 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
     if AFTER.load(Ordering::Relaxed) == frame {
         tracing::warn!(frame, levels = ?crate::capture::recent_levels(), "levels after the black frame");
     }
-    *last = (black, drawn, last.2);
+    *last = (shown.map(|black| (frame, black)), drawn, last.2);
 }
 
 /// A run of destination pages: how they are mapped (0 pool pages from
@@ -942,7 +1074,9 @@ extern "system" fn copy_page_mappings(
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| {
+            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
+        });
     }
     S_OK
 }
@@ -1004,6 +1138,141 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn black_transition_requires_a_previous_visible_sample() {
+        assert!(new_black_transition(Some((708, false)), 709, Some(true)));
+        assert!(!new_black_transition(None, 1, Some(true)));
+        assert!(!new_black_transition(Some((708, true)), 709, Some(true)));
+        assert!(!new_black_transition(Some((708, false)), 710, Some(true)));
+        assert!(!new_black_transition(Some((708, false)), 709, None));
+    }
+
+    #[cfg(windows)]
+    fn test_queue() -> This {
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = std::ptr::null();
+        assert_eq!(
+            create(std::ptr::null(), &desc, &QUEUE_IIDS[0], &mut q),
+            S_OK
+        );
+        q
+    }
+
+    #[cfg(windows)]
+    fn test_fence() -> This {
+        let mut fence = std::ptr::null();
+        assert_eq!(
+            crate::fence::create(
+                std::ptr::null(),
+                0,
+                0,
+                &crate::fence::FENCE_IIDS[0],
+                &mut fence
+            ),
+            S_OK
+        );
+        fence
+    }
+
+    #[cfg(windows)]
+    fn enqueue(q: This, items: impl IntoIterator<Item = Held>) {
+        lock(&queue(q).held).extend(items);
+        lock(&WAITING).push(q as usize);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn present_releases_producer_before_waiting_consumer() {
+        let producer = test_queue();
+        let consumer = test_queue();
+        let ready = test_fence();
+        let produced = test_fence();
+        let consumed = test_fence();
+        // Visit the consumer first. Its wait must not be passed; the
+        // producer's signal makes it ready in the next release pass.
+        enqueue(
+            consumer,
+            [
+                Held::Wait(produced as usize, 4),
+                Held::Signal(consumed as usize, 9),
+            ],
+        );
+        enqueue(
+            producer,
+            [
+                Held::Wait(ready as usize, 2),
+                Held::Signal(produced as usize, 4),
+            ],
+        );
+        crate::fence::set(ready, 2);
+        drain_present(|| {});
+        assert_eq!(crate::fence::completed(produced), 4);
+        assert_eq!(crate::fence::completed(consumed), 9);
+        assert!(lock(&queue(producer).held).is_empty());
+        assert!(lock(&queue(consumer).held).is_empty());
+        assert_eq!(release(producer), 0);
+        assert_eq!(release(consumer), 0);
+        for fence in [ready, produced, consumed] {
+            assert_eq!(
+                slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence),
+                0
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn present_keeps_unmet_wait_and_later_signal_resumes_queue() {
+        let waiting = test_queue();
+        let gate = test_fence();
+        let output = test_fence();
+        enqueue(
+            waiting,
+            [
+                Held::Wait(gate as usize, 3),
+                Held::Signal(output as usize, 6),
+            ],
+        );
+        drain_present(|| {});
+        assert_eq!(crate::fence::completed(output), 0);
+        assert_eq!(lock(&queue(waiting).held).len(), 2);
+        #[cfg(feature = "diagnostics")]
+        assert!(blocked_present_summary().iter().any(|(_, count, reason)| {
+            *count == 2 && *reason == "fence"
+        }));
+        // A producer submitted after the present is still able to resume
+        // this queue, without executing the consumer prematurely.
+        crate::fence::set(gate, 3);
+        release_held(false);
+        assert_eq!(crate::fence::completed(output), 6);
+        assert!(lock(&queue(waiting).held).is_empty());
+        assert_eq!(release(waiting), 0);
+        for fence in [gate, output] {
+            assert_eq!(
+                slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence),
+                0
+            );
+        }
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn blocked_fingerprint_reports_reason_and_count_changes() {
+        let fence = [(0, 2, "fence")];
+        let memory = [(0, 2, "memory")];
+        let longer = [(0, 3, "fence")];
+        assert_eq!(blocked_signature(&[]), 0);
+        assert_eq!(blocked_signature(&fence), blocked_signature(&fence));
+        assert_ne!(blocked_signature(&fence), blocked_signature(&memory));
+        assert_ne!(blocked_signature(&fence), blocked_signature(&longer));
+    }
 
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's

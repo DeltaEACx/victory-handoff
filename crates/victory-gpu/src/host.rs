@@ -599,7 +599,30 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // Hardware fixtures must not accidentally test the integrated
+            // GPU when the title normally uses the discrete adapter.
+            #[cfg(test)]
+            let test_adapter = if std::env::var_os("VICTORY_TEST_DISCRETE_GPU").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+            {
+                let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+                let adapter: IDXGIAdapter1 =
+                    factory.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)?;
+                let desc = adapter.GetDesc1()?;
+                let name = String::from_utf16_lossy(&desc.Description);
+                tracing::info!(
+                    adapter = name.trim_end_matches('\0'),
+                    vendor = format_args!("{:#06x}", desc.VendorId),
+                    device = format_args!("{:#06x}", desc.DeviceId),
+                    "hardware test adapter"
+                );
+                Some(adapter.cast::<windows::core::IUnknown>()?)
+            } else {
+                None
+            };
+            #[cfg(not(test))]
+            let test_adapter: Option<windows::core::IUnknown> = None;
+            D3D12CreateDevice(test_adapter.as_ref(), D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -5777,6 +5800,9 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        #[cfg(feature = "diagnostics")]
+        let [views_ms, buffers_ms, textures_ms] = [0, 1, 2]
+            .map(|i| crate::draw::HEAP_PHASE_MICROS[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -5791,6 +5817,12 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            if picked > 0.0 {
+                tracing::info!(
+                    "heap pass ms/frame: {views_ms:.1} view reconciliation, {buffers_ms:.1} buffer refresh scheduling, {textures_ms:.1} texture mapping and staging"
+                );
+            }
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -5921,8 +5953,9 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
+    /// as frame `frame` (saved if captures are on). Returns whether the
+    /// frame was black in diagnostics builds, `None` if not shown or if
+    /// diagnostics didn't get a sample.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
@@ -6003,7 +6036,11 @@ impl Host {
                 .then(|| crate::capture::read_back(&self.device, list, texture))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let probe = if slot.is_none() && crate::capture::probe_enabled() {
+                crate::capture::probe(&self.device, list, texture)
+            } else {
+                None
+            };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             list.ResourceBarrier(&[
@@ -6026,10 +6063,14 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if let Err(error) = p.swap_chain.Present(0, DXGI_PRESENT(0)).ok() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(%error, "DXGI present failed"));
+                return None;
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            return probe.as_ref().and_then(|b| crate::capture::black(frame, b));
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }

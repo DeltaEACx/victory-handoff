@@ -69,12 +69,12 @@ impl Pending {
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
+/// not translate, else "refused" or its precise queue/worker state.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        None => Some(pending_state(p.queue_state.load(Ordering::Relaxed)).into()),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
@@ -88,6 +88,17 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
                 failed.join(" + ")
             })
         }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn pending_state(state: u8) -> &'static str {
+    match state {
+        NOT_QUEUED => "not queued",
+        EARLY => "queued early",
+        REQUESTED => "queued for draw",
+        MAKING => "worker compiling",
+        _ => "unknown pipeline state",
     }
 }
 
@@ -348,6 +359,21 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn missing_distinguishes_queue_delay_from_worker_compilation() {
+        let p = Pending::new(Vec::new(), None);
+        assert_eq!(missing(&p).as_deref(), Some("not queued"));
+        for (state, expected) in [
+            (EARLY, "queued early"),
+            (REQUESTED, "queued for draw"),
+            (MAKING, "worker compiling"),
+        ] {
+            p.queue_state.store(state, Ordering::Relaxed);
+            assert_eq!(missing(&p).as_deref(), Some(expected));
+        }
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).

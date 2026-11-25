@@ -110,6 +110,8 @@ const _: () = assert!(size_of::<HeapDesc>() == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
 
 const BUFFER: u32 = 1;
+#[cfg(windows)]
+const TEXTURE_2D: u32 = 3;
 const TEXTURE_3D: u32 = 4;
 
 /// Bytes per element and the element's width in texels (4 for block
@@ -608,6 +610,34 @@ pub(crate) fn family(format: u32) -> u32 {
 
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
+
+/// Only ordinary 2D sampled RGBA8 textures participate in the opt-in
+/// dual-view experiment. Preserve render targets, depth, UAVs, MSAA,
+/// arrays, and storage already typeless in the title.
+#[cfg(windows)]
+fn sampled_rgba8(desc: &ResourceDesc) -> Option<u32> {
+    (desc.dimension == TEXTURE_2D
+        && desc.depth_or_array_size == 1
+        && desc.sample_count == 1
+        && desc.flags & 0xf == 0
+        && matches!(desc.format, 28 | 29))
+    .then_some(desc.format)
+}
+
+#[cfg(windows)]
+pub(crate) fn rgba8_srgb_views() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_RGBA8_SRGB_VIEWS").is_some_and(|v| v == "1"))
+}
+
+/// Original default interpretation of a texture backed by the experiment.
+#[cfg(windows)]
+pub(crate) fn sampled_rgba8_default(this: This, host_format: u32) -> Option<u32> {
+    if this.is_null() || host_format != 27 {
+        return None;
+    }
+    sampled_rgba8(&resource(this).desc)
+}
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
@@ -1660,6 +1690,12 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    if clear.is_null()
+        && rgba8_srgb_views()
+        && let Some(typed) = sampled_rgba8(&d)
+    {
+        d.format = family(typed);
+    }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
@@ -2384,6 +2420,26 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn dual_rgba8_views_only_change_sampled_2d_storage() {
+        let rgba = texture(64, 32, 28, 4);
+        assert_eq!(sampled_rgba8(&rgba), Some(28));
+        assert_eq!(sampled_rgba8(&ResourceDesc { format: 29, ..rgba }), Some(29));
+        for desc in [
+            ResourceDesc { format: 27, ..rgba },
+            ResourceDesc { format: 98, ..rgba },
+            ResourceDesc { depth_or_array_size: 2, ..rgba },
+            ResourceDesc { sample_count: 4, ..rgba },
+            ResourceDesc { flags: 1, ..rgba },
+            ResourceDesc { flags: 2, ..rgba },
+            ResourceDesc { flags: 4, ..rgba },
+            ResourceDesc { flags: 8, ..rgba },
+        ] {
+            assert_eq!(sampled_rgba8(&desc), None);
+        }
+    }
+
     #[test]
     fn sizes_cover_every_mip() {
         let size = |d: &ResourceDesc| footprint(d).map(|i| i.size);
@@ -2617,6 +2673,10 @@ mod tests {
         }
         let readback = readback.unwrap();
         let host_image = host_resource(image).unwrap();
+        // SAFETY: a live host texture. Exercise both storage types by
+        // running this upload/read-back test with the opt-in off and on.
+        let actual = unsafe { host_image.GetDesc() }.Format.0;
+        assert_eq!(actual, if rgba8_srgb_views() { 27 } else { 28 });
         let back = host.new_list().unwrap();
         let (_, before) = host_transition(image, 0x800).unwrap();
         // The upload list holds the texture until it is reset.

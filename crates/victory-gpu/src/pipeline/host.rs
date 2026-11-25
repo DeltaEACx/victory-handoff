@@ -325,6 +325,18 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        static WIPER_MASK_REPLACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let replace = *WIPER_MASK_REPLACE.get_or_init(|| {
+            std::env::var_os("VICTORY_WIPER_MASK_REPLACE").is_some_and(|v| v == "1")
+        });
+        Self::new_with_wiper_mask_replace(shaders, g, replace)
+    }
+
+    fn new_with_wiper_mask_replace(
+        shaders: &[Arc<Shader>],
+        g: Option<&GraphicsState>,
+        replace: bool,
+    ) -> Option<HostPipeline> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
@@ -546,25 +558,35 @@ impl HostPipeline {
             return refuse("graphics state not kept (plain description)", shaders);
         };
         let state = g.describe();
-        if mesh.is_some() {
+        if let Some(ms) = mesh {
             // "triangles": the stream names its topology since it did not
-            // load from the library without one (see `mesh_pipeline`); a
+            // load from the library without one (see `mesh_pipeline_with_blend`); a
             // new name keeps such entries, stored before, from being
             // looked up again.
+            let replacement = if replace {
+                find("pixel").and_then(|ps| wiper_mask_blend(&ms.hash, &ps.hash, g))
+            } else {
+                None
+            };
             let name = super::library::name(
-                "mesh triangles",
+                if replacement.is_some() { "mesh triangles wiper-u8-replace" } else { "mesh triangles" },
                 &root_blob,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            let pso = match mesh_pipeline_with_blend(
+                &host.device, &root, &root_blob, code(0), code(1), g, &name,
+                replacement.unwrap_or(g.blend),
+            ) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
-                    host.log_messages();
+                    tracing::warn!(error = %e, "host mesh pipeline refused");
                     return None;
                 }
             };
+            if replacement.is_some() {
+                tracing::warn!("WindshieldWiperMask RT2 uses replacement writes instead of integer MAX (opt-in approximation)");
+            }
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
@@ -720,6 +742,31 @@ impl HostPipeline {
     }
 }
 
+/// Opt-in workaround only for the observed invalid PSO. Replacement is
+/// not MAX when fragments overlap, so no other state or pass is modified.
+fn wiper_mask_blend(ms: &str, ps: &str, g: &GraphicsState) -> Option<D3D12_BLEND_DESC> {
+    if (ms, ps) != ("f5e50eb2108c425b", "ce3f0432a08f1d35")
+        || g.targets.NumRenderTargets != 3
+        || g.targets.RTFormats[..3] != [DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT]
+        || !g.blend.IndependentBlendEnable.as_bool()
+    {
+        return None;
+    }
+    let mut blend = g.blend;
+    let rt = &mut blend.RenderTarget[2];
+    if !rt.BlendEnable.as_bool()
+        || rt.LogicOpEnable.as_bool()
+        || rt.BlendOp != D3D12_BLEND_OP_MAX
+        || rt.SrcBlend != D3D12_BLEND_ONE
+        || rt.DestBlend != D3D12_BLEND_ONE
+        || rt.RenderTargetWriteMask != D3D12_COLOR_WRITE_ENABLE_RED.0 as u8
+    {
+        return None;
+    }
+    rt.BlendEnable = false.into();
+    Some(blend)
+}
+
 /// A mesh pipeline from the title's graphics state: the pipeline-state
 /// stream form (no input layout).
 ///
@@ -731,13 +778,15 @@ impl HostPipeline {
 /// "already exists"). The translation makes triangle mesh shaders only
 /// (`mesh_prologue` refuses others), and the debug layer wants the two to
 /// agree (1323).
-fn mesh_pipeline(
+fn mesh_pipeline_with_blend(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
+    root_blob: &[u8],
     ms: D3D12_SHADER_BYTECODE,
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
     name: &str,
+    blend: D3D12_BLEND_DESC,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
     /// A stream subobject: its type, then its description, pointer-aligned.
@@ -761,7 +810,7 @@ fn mesh_pipeline(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
@@ -778,13 +827,121 @@ fn mesh_pipeline(
         pPipelineStateSubobjectStream: (&raw mut stream).cast(),
     };
     let device = device.cast::<ID3D12Device2>()?;
+    // A library load can fail even when creation succeeds. Only report a
+    // failed CreatePipelineState, not the library's normal miss/mismatch.
     super::library::pipeline(
         name,
         // SAFETY: the stream holds whole subobjects pointing at live data.
         |library, name| unsafe { library.LoadPipeline(name, &desc) },
         // SAFETY: as above.
-        || unsafe { device.CreatePipelineState(&desc) },
+        || {
+            #[cfg(feature = "diagnostics")]
+            let queue = device.cast::<ID3D12InfoQueue>().ok();
+            #[cfg(feature = "diagnostics")]
+            let before = queue.as_ref().map(|q| unsafe { q.GetNumStoredMessages() });
+            let result = unsafe { device.CreatePipelineState(&desc) };
+            #[cfg(feature = "diagnostics")]
+            if result.is_err() {
+                mesh_creation_failure(g, &blend, root_blob, &ms, &ps, before, queue.as_ref());
+            }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = root_blob;
+            result
+        },
     )
+}
+
+/// Only scalar host-stream fields and hashes: never the title's
+/// stream, shader bytes, root-signature contents, pointers or library name.
+#[cfg(feature = "diagnostics")]
+fn mesh_effective_blends(
+    g: &GraphicsState,
+    blend: &D3D12_BLEND_DESC,
+) -> Vec<(i32, usize, D3D12_RENDER_TARGET_BLEND_DESC)> {
+    let independent = blend.IndependentBlendEnable.as_bool();
+    g.targets.RTFormats[..(g.targets.NumRenderTargets as usize).min(8)]
+        .iter()
+        .enumerate()
+        .map(|(i, format)| {
+            let state_slot = if independent { i } else { 0 };
+            (format.0, state_slot, blend.RenderTarget[state_slot])
+        })
+        .collect()
+}
+
+#[cfg(feature = "diagnostics")]
+fn mesh_creation_failure(
+    g: &GraphicsState,
+    blend: &D3D12_BLEND_DESC,
+    root_blob: &[u8],
+    ms: &D3D12_SHADER_BYTECODE,
+    ps: &D3D12_SHADER_BYTECODE,
+    before: Option<u64>,
+    queue: Option<&ID3D12InfoQueue>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static REPORTS: AtomicUsize = AtomicUsize::new(0);
+    if REPORTS.fetch_add(1, Ordering::Relaxed) >= 8 {
+        return;
+    }
+    let hash = |bytes: &[u8]| blake3::hash(bytes).to_hex()[..16].to_owned();
+    let rtvs: Vec<i32> = g.targets.RTFormats[..(g.targets.NumRenderTargets as usize).min(8)]
+        .iter()
+        .map(|f| f.0)
+        .collect();
+    tracing::warn!(
+        pipeline_type = "mesh",
+        root_signature_hash = %hash(root_blob),
+        mesh_shader_hash = %hash(&code_bytes(ms)),
+        pixel_shader_hash = %hash(&code_bytes(ps)),
+        rtv_count = g.targets.NumRenderTargets,
+        ?rtvs,
+        dsv = g.depth_format.0,
+        topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0,
+        sample_count = g.samples.Count,
+        sample_quality = g.samples.Quality,
+        "mesh CreatePipelineState failed: host stream fields"
+    );
+    tracing::warn!(
+        independent_blend = blend.IndependentBlendEnable.as_bool(),
+        alpha_to_coverage = blend.AlphaToCoverageEnable.as_bool(),
+        all_rtv_formats = ?g.targets.RTFormats.map(|f| f.0),
+        effective_rt_state = ?mesh_effective_blends(g, blend),
+        sample_mask = g.sample_mask,
+        depth_stencil = ?g.depth,
+        rasterizer = ?g.rasterizer,
+        "mesh CreatePipelineState failed: expanded fixed-function state (format, blend slot, state)"
+    );
+    let Some(queue) = queue else {
+        tracing::warn!("mesh CreatePipelineState: no D3D12 InfoQueue (enable VICTORY_D3D12_DEBUG)");
+        return;
+    };
+    // Do not clear the shared queue: other threads may be using it. Cap
+    // both message count and allocation, and never print arbitrary names
+    // or paths that the runtime may include in a message description.
+    let end = unsafe { queue.GetNumStoredMessages() };
+    let start = before.unwrap_or(end).min(end);
+    let shown = end.saturating_sub(start).min(8);
+    let first = end - shown;
+    tracing::warn!(messages = end.saturating_sub(start), shown, "mesh CreatePipelineState InfoQueue");
+    for index in first..end {
+        let mut size = 0;
+        if unsafe { queue.GetMessage(index, None, &mut size) }.is_err()
+            || size < size_of::<D3D12_MESSAGE>()
+            || size > 8192
+        {
+            continue;
+        }
+        let mut buffer = vec![0u64; size.div_ceil(8)];
+        let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+        if unsafe { queue.GetMessage(index, Some(message), &mut size) }.is_ok() {
+            let message = unsafe { &*message };
+            // Message IDs and severity identify the exact SDK diagnostic.
+            // Descriptions may contain application-supplied object names,
+            // paths or bytecode, so do not copy them to the log.
+            tracing::warn!(id = message.ID.0, severity = message.Severity.0, "mesh D3D12 InfoQueue message");
+        }
+    }
 }
 
 /// The bytes of shader code (none for an absent stage).
@@ -849,6 +1006,112 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    fn wiper_graphics() -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 3;
+        for (i, format) in [DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT].into_iter().enumerate() {
+            g.targets.RTFormats[i] = format;
+            let rt = &mut g.blend.RenderTarget[i];
+            rt.BlendEnable = true.into();
+            rt.DestBlend = D3D12_BLEND_ONE;
+            rt.BlendOp = D3D12_BLEND_OP_MAX;
+        }
+        g.blend.IndependentBlendEnable = true.into();
+        g.blend.RenderTarget[1].DestBlendAlpha = D3D12_BLEND_ONE;
+        g.blend.RenderTarget[1].BlendOpAlpha = D3D12_BLEND_OP_MAX;
+        g.blend.RenderTarget[2].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED.0 as u8;
+        g.depth.DepthEnable = false.into();
+        g.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        g.depth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        g.depth.StencilWriteMask = 0;
+        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        g.rasterizer.FrontCounterClockwise = true.into();
+        g
+    }
+
+    #[test]
+    fn wiper_mask_replacement_changes_only_the_observed_uint8_max_target() {
+        let mut g = wiper_graphics();
+        let ms = "f5e50eb2108c425b";
+        let ps = "ce3f0432a08f1d35";
+        let changed = wiper_mask_blend(ms, ps, &g).unwrap();
+        assert_eq!(changed.RenderTarget[..2], g.blend.RenderTarget[..2]);
+        assert!(!changed.RenderTarget[2].BlendEnable.as_bool());
+        let mut expected = g.blend;
+        expected.RenderTarget[2].BlendEnable = false.into();
+        assert_eq!(changed, expected);
+        assert!(g.blend.RenderTarget[2].BlendEnable.as_bool());
+        assert!(wiper_mask_blend("other mesh", ps, &g).is_none());
+        assert!(wiper_mask_blend(ms, "other pixel", &g).is_none());
+        g.blend.RenderTarget[2].BlendOp = D3D12_BLEND_OP_MIN;
+        assert!(wiper_mask_blend(ms, ps, &g).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires original wiper containers in VICTORY_WIPER_FIXTURES, DXIL validator, and hardware mesh support"]
+    fn original_wiper_pipeline_creates_with_opt_in_uint8_replacement() {
+        use victory_shader::emit::validator::Validator;
+
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let host = host().expect("hardware host");
+        assert!(host.mesh_shaders());
+        let mut validator = Validator::load(Validator::default_path().as_deref())
+            .expect("Windows SDK DXIL validator");
+        let dir = std::env::var_os("VICTORY_WIPER_FIXTURES").expect("original wiper fixtures path");
+        let shaders: Vec<_> = [
+            ("mesh", "f5e50eb2108c425b"),
+            ("pixel", "ce3f0432a08f1d35"),
+        ].into_iter().map(|(stage, hash)| {
+            let path = std::fs::read_dir(&dir).unwrap().map(Result::unwrap).map(|e| e.path())
+                .find(|p| p.to_string_lossy().ends_with(&format!(".{hash}.cdxil")))
+                .expect(hash);
+            let shader = super::super::shader(stage, &std::fs::read(path).unwrap());
+            assert_eq!(shader.hash, hash);
+            let mut translated = super::super::translate(&shader.container).expect(hash);
+            validator.validate(&mut translated.host.dxil).expect(hash);
+            assert!(shader.translated.set(Some(translated)).is_ok());
+            shader
+        }).collect();
+        let g = wiper_graphics();
+        host.log_messages();
+        assert!(HostPipeline::new_with_wiper_mask_replace(&shaders, Some(&g), false).is_none());
+        let error = host.log_messages();
+        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+            assert!(
+                error.as_deref().is_some_and(|e| e.contains("R8_UINT") && e.contains("blending")),
+                "expected the original blend rejection; got {error:?}"
+            );
+        }
+        let accepted = HostPipeline::new_with_wiper_mask_replace(&shaders, Some(&g), true);
+        let error = host.log_messages();
+        assert!(accepted.is_some() && error.is_none(), "fallback PSO: {error:?}");
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn mesh_failure_reports_the_effective_state_of_an_integer_rt() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 3;
+        for (i, format) in [41, 28, 62].into_iter().enumerate() {
+            g.targets.RTFormats[i] = DXGI_FORMAT(format);
+        }
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[0].RenderTargetWriteMask = 0xf;
+        g.blend.RenderTarget[2].BlendEnable = false.into();
+        g.blend.RenderTarget[2].RenderTargetWriteMask = 1;
+        let last = |g: &GraphicsState| {
+            let (format, slot, state) = mesh_effective_blends(g, &g.blend)[2];
+            (format, slot, state.BlendEnable.as_bool(), state.RenderTargetWriteMask)
+        };
+        assert_eq!(last(&g), (62, 0, true, 0xf));
+        g.blend.IndependentBlendEnable = true.into();
+        assert_eq!(last(&g), (62, 2, false, 1));
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
@@ -920,9 +1183,9 @@ mod tests {
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made");
+        mesh_pipeline_with_blend(&host.device, &root, &root_blob, code(&ms), code(&ps), &g, &name, g.blend).expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made again");
+        mesh_pipeline_with_blend(&host.device, &root, &root_blob, code(&ms), code(&ps), &g, &name, g.blend).expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"

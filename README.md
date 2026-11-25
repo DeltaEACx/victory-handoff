@@ -10,6 +10,10 @@ correctly and playably on one particular PC.
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
+**Development handoff:** start with [the Windows build and test instructions](handoff/README.md)
+and [the latest RTX 4050 status](handoff/PROGRESS.md). The status below
+describes the upstream fork's own test system, not this handoff's results.
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its

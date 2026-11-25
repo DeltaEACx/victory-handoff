@@ -5616,7 +5616,44 @@ impl<'a> Lower<'a> {
                 .filter(|(s, b)| *s != site && *b == a && same(*s))
                 .find_map(|(s, _)| use_of(*s))
         };
-        let use_at = use_of(site).or_else(twin);
+        // A texture whose descriptor is read solely for its dimensions has
+        // no resource-use edge of its own. In the puddle shaders the compiler
+        // loads other textures from the same indexed table immediately after
+        // extracting width/height/mip fields. Their image instructions
+        // establish the descriptor layout; the heap index for the dimension
+        // query still comes from *this* load, not from its neighbour.
+        // Require a used 2D image load in the same short instruction window,
+        // as well as the actual width/height/mip field reads below. Unknown
+        // descriptor dwords remain missing rather than invented.
+        let nearby_images = || {
+            let a = address?;
+            if count != 8 || a.dynamic.is_none() || ![1u8, 2, 3].into_iter().all(|k| {
+                inst.write(Reg::S(code + k))
+                    .is_some_and(|v| self.computed_with(v, 6))
+            }) {
+                return None;
+            }
+            let mut neighbours: Vec<_> = x.res.scalar.iter().filter_map(|(s, b)| {
+                let other = &x.p.blocks[s.0].insts[s.1];
+                if *s == site
+                    || b.param != a.param
+                    || b.offset != a.offset
+                    || b.dynamic.is_none()
+                    || other.name() != inst.name()
+                    || other.machine.offset <= inst.machine.offset
+                    || other.machine.offset - inst.machine.offset > 0x80
+                {
+                    return None;
+                }
+                Some((other.machine.offset, use_of(*s)?))
+            }).collect();
+            neighbours.sort_by_key(|(offset, _)| *offset);
+            neighbours.into_iter().find_map(|(_, used)| {
+                let ui = &x.p.blocks[used.0.0].insts[usize::from(used.0.1)];
+                matches!(ui.fields, Fields::Image { dim: 1, .. }).then_some(used)
+            })
+        };
+        let use_at = use_of(site).or_else(twin).or_else(nearby_images);
         let Some((at, first)) = use_at else {
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load

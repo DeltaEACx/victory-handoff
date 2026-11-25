@@ -334,28 +334,51 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+        if max == 0 {
+            return Vec::new();
+        }
+        let mut again = Vec::new();
+        let mut fresh = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((w.written, index, w.write));
+            class.push((index, w.write));
         }
-        // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+
+        // Scene transitions can have tens of thousands of ready slots.
+        // Partition around the requested prefix/suffix; only sort what
+        // this pass can actually use. Write numbers are unique.
+        let newest = |&(_, write): &(u32, u64)| std::cmp::Reverse(write);
+        let oldest = |&(_, write): &(u32, u64)| write;
+        if again.len() > max {
+            again.select_nth_unstable_by_key(max, newest);
+            again.truncate(max);
+        }
+        again.sort_unstable_by_key(newest);
+
+        let take = (max - again.len()).min(fresh.len());
+        if take == 0 {
+            return again;
+        }
+        let new_count = take.div_ceil(2);
+        let old_count = take / 2;
+        if new_count < fresh.len() {
+            fresh.select_nth_unstable_by_key(new_count, newest);
+        }
+        let (new, older) = fresh.split_at_mut(new_count);
+        new.sort_unstable_by_key(newest);
+        if old_count > 0 && old_count < older.len() {
+            older.select_nth_unstable_by_key(old_count, oldest);
+        }
+        let old = &mut older[..old_count];
+        old.sort_unstable_by_key(oldest);
+        again.reserve(take);
+        for (i, &entry) in new.iter().enumerate() {
+            again.push(entry);
+            if let Some(&entry) = old.get(i) {
+                again.push(entry);
             }
         }
-        order.truncate(max);
-        order
+        again
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -1451,6 +1474,32 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     }
 }
 
+/// A typeless replacement needs a typed view even for the title's default
+/// descriptor. Preserve explicit UNORM/sRGB views; other RGBA8 casts keep
+/// the interpretation they got from the former typed host texture.
+fn sampled_rgba8_srv(
+    desc: Option<D3D12_SHADER_RESOURCE_VIEW_DESC>,
+    default: u32,
+) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    let Some(mut desc) = desc else {
+        return D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT(default as i32),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: u32::MAX,
+                    ..Default::default()
+                },
+            },
+        };
+    };
+    if matches!(desc.Format.0, 0 | 27 | 30..=32) {
+        desc.Format = DXGI_FORMAT(default as i32);
+    }
+    desc
+}
+
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
@@ -1785,6 +1834,44 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+/// One bit per direction of a linear/sRGB reinterpretation. These are
+/// DXGI pairs; BC formats are included for diagnostics, not UAV conversion.
+#[cfg(feature = "diagnostics")]
+fn transfer_change(requested: u32, actual: u32) -> Option<(u32, bool)> {
+    const PAIRS: [(u32, u32); 7] = [
+        (28, 29), (87, 91), (88, 93), (71, 72), (74, 75), (77, 78), (98, 99),
+    ];
+    PAIRS.iter().enumerate().find_map(|(i, &(linear, srgb))| {
+        if (requested, actual) == (srgb, linear) {
+            Some((1 << (2 * i), false))
+        } else if (requested, actual) == (linear, srgb) {
+            Some((1 << (2 * i + 1), true))
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(feature = "diagnostics")]
+fn note_transfer_change(requested: u32, actual: u32, desc: &D3D12_RESOURCE_DESC) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    if let Some((key, host_decodes_srgb)) = transfer_change(requested, actual)
+        && SEEN.fetch_or(key, Ordering::Relaxed) & key == 0
+    {
+        tracing::warn!(
+            frame = crate::frame::current(),
+            requested,
+            actual,
+            host_decodes_srgb,
+            width = desc.Width,
+            height = desc.Height,
+            flags = desc.Flags.0,
+            "typed host texture changes shader view sRGB decoding"
+        );
+    }
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -1844,6 +1931,10 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     if let Some(format) = format
         && !typeless
     {
+        #[cfg(feature = "diagnostics")]
+        if !unordered {
+            note_transfer_change(view, own, &d);
+        }
         *format = d.Format;
     }
     true
@@ -1968,6 +2059,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                if crate::resource::rgba8_srgb_views() {
+                    // SAFETY: a live host texture. Only opt-in f27 storage
+                    // that replaces a formerly typed texture qualifies.
+                    let format = unsafe { texture.GetDesc() }.Format.0 as u32;
+                    if let Some(default) = crate::resource::sampled_rgba8_default(resource, format) {
+                        desc = Some(sampled_rgba8_srv(desc, default));
+                    }
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -2296,6 +2395,39 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dual_rgba8_srv_preserves_defaults_and_explicit_transfers() {
+        let all = sampled_rgba8_srv(None, 29);
+        assert_eq!(all.Format.0, 29);
+        assert_eq!(all.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2D);
+        assert_eq!(all.Shader4ComponentMapping, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+        // SAFETY: the dimension selects Texture2D.
+        assert_eq!(unsafe { all.Anonymous.Texture2D }.MipLevels, u32::MAX);
+        let explicit = |format| {
+            let mut desc = all;
+            desc.Format.0 = format;
+            sampled_rgba8_srv(Some(desc), 28)
+        };
+        for (requested, actual) in [(0, 28), (27, 28), (28, 28), (29, 29), (30, 28), (31, 28), (32, 28), (91, 91)] {
+            assert_eq!(explicit(requested).Format.0, actual);
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn transfer_changes_distinguish_decode_direction_from_other_casts() {
+        let (loss, decode) = transfer_change(29, 28).unwrap();
+        assert!(!decode);
+        let (gain, decode) = transfer_change(28, 29).unwrap();
+        assert!(decode);
+        assert_eq!(loss & gain, 0);
+        assert_ne!(transfer_change(99, 98), Some((loss, false)));
+        assert!(transfer_change(99, 98).is_some());
+        for (requested, actual) in [(29, 29), (28, 27), (29, 87), (32, 28), (0, 28)] {
+            assert_eq!(transfer_change(requested, actual), None);
+        }
+    }
+
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
     #[test]
@@ -2431,6 +2563,73 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// Reference: sort all eligible writes, then take a bounded prefix of
+    /// the original order. Independent of the selection in `due`.
+    fn full_sort_due(q: &TextureQueue, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        let (mut retry, mut fresh): (Vec<_>, Vec<_>) = q
+            .slots
+            .iter()
+            .filter(|(_, w)| w.due <= frame)
+            .partition(|(_, w)| w.looks > 0 || w.mapped > 0);
+        let newest = |&(_, w): &(&u32, &Waiting)| std::cmp::Reverse(w.write);
+        retry.sort_unstable_by_key(newest);
+        fresh.sort_unstable_by_key(newest);
+        let mut order: Vec<_> = retry.into_iter().take(max).map(|(&i, w)| (i, w.write)).collect();
+        let mut fresh = std::collections::VecDeque::from(fresh);
+        let mut front = true;
+        while order.len() < max {
+            let entry = if front { fresh.pop_front() } else { fresh.pop_back() };
+            let Some((&i, w)) = entry else { break };
+            order.push((i, w.write));
+            front = !front;
+        }
+        order
+    }
+
+    fn texture_backlog(count: u32) -> TextureQueue {
+        let mut q = TextureQueue::default();
+        for n in 0..count {
+            // Scramble slot order without duplicating power-of-two indices.
+            let index = n.wrapping_mul(25013) % count;
+            let frame = u64::from(n % 23);
+            q.written(index, frame, frame + u64::from(n % 7), false);
+            match n % 11 {
+                0 => q.later(index, q.writes, frame, 16),
+                1 => q.partly(index, q.writes, frame + 2, 4096),
+                _ => {}
+            }
+        }
+        q
+    }
+
+    #[test]
+    fn bounded_texture_selection_matches_full_sort() {
+        for count in [0, 1, 64, 32_768] {
+            let q = texture_backlog(count);
+            for frame in [0, 12, 40] {
+                for max in [0, 1, 2, 3, 7, 4095, 4096, 4097, count as usize + 1] {
+                    assert_eq!(q.due(frame, max), full_sort_due(&q, frame, max), "{count} slots at frame {frame}, cap {max}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "offline microbenchmark; use an optimized test build"]
+    fn texture_selection_backlog_microbenchmark() {
+        let q = texture_backlog(32_768);
+        let iterations = 80;
+        let run = |select: fn(&TextureQueue, u64, usize) -> Vec<(u32, u64)>| {
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(select(std::hint::black_box(&q), 40, 4096));
+            }
+            start.elapsed() / iterations
+        };
+        assert_eq!(q.due(40, 4096), full_sort_due(&q, 40, 4096));
+        eprintln!("32,768 slots; cap 4,096; mean per call: full sort {:?}; bounded {:?}", run(full_sort_due), run(TextureQueue::due));
     }
 
     /// A view written over memory that older views describe otherwise

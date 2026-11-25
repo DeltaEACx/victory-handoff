@@ -63,6 +63,34 @@ fn err(e: windows::core::Error) -> String {
 }
 
 impl Host {
+    /// Adapter name and wave limits of the device used for pipeline checks.
+    /// Querying the real device avoids an offline check silently targeting
+    /// wave64 while creating its PSO on a wave32-only adapter.
+    pub fn wave_target(&self) -> Result<(String, u32, u32), String> {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: initialized feature storage and interfaces owned by this Host.
+        unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .map_err(err)?;
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+            let adapter: IDXGIAdapter1 = factory
+                .EnumAdapterByLuid(self.device.GetAdapterLuid())
+                .map_err(err)?;
+            let desc = adapter.GetDesc1().map_err(err)?;
+            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            Ok((
+                String::from_utf16_lossy(&desc.Description[..end]),
+                options.WaveLaneCountMin,
+                options.WaveLaneCountMax,
+            ))
+        }
+    }
+
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");

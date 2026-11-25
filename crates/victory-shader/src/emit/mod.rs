@@ -82,6 +82,7 @@
 
 mod bitcode;
 mod container;
+mod converge;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
@@ -111,6 +112,12 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
+
+/// Maximum lane count selected for translation (0 when no host was probed).
+/// Disk caches must include it: wave64 and wave32 hosts emit different code.
+pub fn host_max_wave() -> u32 {
+    lower::host_max_wave()
+}
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -306,6 +313,32 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    let (shader, wave) = emit_with_fallbacks(c, native, p, st, io, res)?;
+    check_host_wave(wave, lower::host_max_wave())?;
+    Ok(shader)
+}
+
+/// Check only after the exact retry forms have had a chance to lower wave64.
+/// Keep the requirement alongside the shader through *every* successful exit,
+/// including constant-edge threading; dropping it earlier hides an invalid PSO.
+fn check_host_wave(required: Option<u32>, host_max: u32) -> Result<(), ShaderError> {
+    if host_max != 0 && required.is_some_and(|lanes| lanes > host_max) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "required wave size exceeds the host maximum",
+        });
+    }
+    Ok(())
+}
+
+fn emit_with_fallbacks(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
@@ -333,6 +366,20 @@ pub fn emit(
             }
         };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
+        // One 64-thread console wave can run as two 32-lane host waves when
+        // native scalar control converges before every shared-memory exchange.
+        // Preserve observable scalar PHIs; do not enable approximate halves.
+        if let Ok((p, st)) = converge::one_wave(native, p) {
+            let again = (|| {
+                let io = io::raise(&p, native)?;
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+                emit_program(c, native, &p, &st, &io, &res)
+            })();
+            report("one-wave convergence", &again);
+            if done(&again) {
+                return again;
+            }
+        }
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
@@ -370,7 +417,7 @@ pub fn emit(
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
-                    return again.map(|(shader, _)| shader);
+                    return again;
                 }
             }
         }
@@ -395,7 +442,7 @@ pub fn emit(
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
-                        return again.map(|(shader, _)| shader);
+                        return again;
                     }
                 }
                 // Still stopped where not every lane runs: the per-lane branches around
@@ -412,7 +459,7 @@ pub fn emit(
                         let again = widen(c, native, base, why);
                         report("wave-wide branches", &again);
                         if done(&again) {
-                            return again.map(|(shader, _)| shader);
+                            return again;
                         }
                     }
                 }
@@ -430,7 +477,7 @@ pub fn emit(
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
-                        return local.map(|(shader, _)| shader);
+                        return local;
                     }
                 }
             }
@@ -438,7 +485,7 @@ pub fn emit(
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return local;
                 }
             }
         }
@@ -450,14 +497,14 @@ pub fn emit(
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
-                            return local.map(|(shader, _)| shader);
+                            return local;
                         }
                     }
                 }
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return local;
                 }
             }
         }
@@ -479,7 +526,6 @@ pub fn emit(
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -493,7 +539,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -759,6 +805,317 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    struct RestoreHost(Option<u32>);
+    impl Drop for RestoreHost {
+        fn drop(&mut self) {
+            lower::TEST_HOST_WAVE.set(self.0);
+        }
+    }
+
+    #[test]
+    fn final_wave_requirement_is_checked_without_rejecting_capable_hosts() {
+        assert!(matches!(
+            super::check_host_wave(Some(64), 32),
+            Err(crate::ShaderError::Unsupported {
+                offset: 0,
+                what: "required wave size exceeds the host maximum",
+            })
+        ));
+        for host in [0, 64, 128] {
+            assert!(super::check_host_wave(Some(64), host).is_ok(), "host {host}");
+        }
+        for host in [0, 32, 64] {
+            assert!(super::check_host_wave(Some(32), host).is_ok(), "host {host}");
+            assert!(super::check_host_wave(None, host).is_ok(), "host {host}");
+        }
+    }
+
+    #[test]
+    fn a_self_lane_lds_loop_is_admitted_without_wave64() {
+        // A same-lane write/read loop uses no cross-half dependency. Its
+        // 128-thread group therefore needs no wave64 exchange or group barrier.
+        // The original 64-thread fixture was made exact by one_wave convergence;
+        // neither is a valid rejection regression. The original 128-thread
+        // DefragHeap container below still covers a truly unresolved case.
+        let words = [
+            0xBE80_0380u32, // s_mov_b32 s0, 0 (separate entry)
+            0x7DA8_00A0, // v_cmpx_gt_u32 exec, 32, v0
+            0xBF88_0007, // s_cbranch_execz to the scalar-dependent store
+            0xD834_0000, 0x0000_0000, // ds_write_b32 v0, v0
+            0xD8D8_0000, 0x0100_0000, // ds_read_b32 v1, v0
+            0x4A00_0081, // v_add_nc_u32 v0, 1, v0
+            0x8100_8100, // s_add_i32 s0, s0, 1
+            0xBF82_FFF7, // s_branch back to the comparison
+            0xBEFE_04C1, // s_mov_b64 exec, -1
+            0x7E02_0200, // v_mov_b32 v1, s0
+            0xD834_0000, 0x0000_0100, // ds_write_b32 v0, v1
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15, // 512 bytes LDS
+                threads: [128, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, true, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let c = Container::parse(&bytes).unwrap();
+        let _restore = RestoreHost(lower::TEST_HOST_WAVE.replace(Some(32)));
+        // Self-lane LDS can lower without a fixed wave size.
+        let (_, wave) = emit_with_fallbacks(&c, &native, &p, &st, &io, &res).unwrap();
+        assert_ne!(wave, Some(64));
+        let output = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut validator) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            validator.validate(&mut output.dxil.clone()).unwrap();
+        }
+        lower::TEST_HOST_WAVE.set(Some(64));
+        let supported = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        lower::TEST_HOST_WAVE.set(Some(0));
+        let unknown = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        assert_eq!(
+            supported, unknown,
+            "capable and unspecified hosts keep their DXIL"
+        );
+    }
+
+    #[test]
+    fn exact_uniform_lds_lowering_still_succeeds_on_wave32() {
+        let words = [
+            0x3402_0082u32, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0001, // ds_write_b32 v1, v0
+            0xD8D8_0000, 0x0000_0001, // ds_read_b32 v0, v1
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15,
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, true, 2).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let c = Container::parse(&bytes).unwrap();
+        let _restore = RestoreHost(lower::TEST_HOST_WAVE.replace(Some(32)));
+        let (expected, wave) = emit_program(&c, &native, &p, &st, &io, &res).unwrap();
+        assert_eq!(wave, Some(32), "the exact two-half LDS path must stay available");
+        assert_eq!(emit(&c, &native, &p, &st, &io, &res).unwrap(), expected);
+        #[cfg(windows)]
+        if let Ok(mut validator) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            validator.validate(&mut expected.dxil.clone()).unwrap();
+        }
+    }
+
+    /// Original title containers are intentionally not checked into the repository.
+    /// Run with VICTORY_WAVE32_FIXTURES pointing at the four unmodified .cdxil files,
+    /// VICTORY_WAVE_LOCAL=idiom and VICTORY_WAVE_WIDE=0; no GPU dispatch or cache writes.
+    #[test]
+    #[ignore = "requires the four original title containers; see VICTORY_WAVE32_FIXTURES"]
+    fn original_wave64_lds_retries_are_target_checked_on_wave32() {
+        let dir = std::env::var_os("VICTORY_WAVE32_FIXTURES").expect("VICTORY_WAVE32_FIXTURES");
+        assert_eq!(std::env::var("VICTORY_WAVE_LOCAL").as_deref(), Ok("idiom"));
+        assert_eq!(std::env::var("VICTORY_WAVE_WIDE").as_deref(), Ok("0"));
+        let files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        let _restore = RestoreHost(lower::TEST_HOST_WAVE.replace(Some(32)));
+        for (hash, group) in [
+            ("02384a60fda6f2d0", 128),
+            ("369cbe906ea72764", 64),
+            ("2cc4c197ee29e291", 64),
+            ("2da4beb386509b77", 256),
+        ] {
+            let paths: Vec<_> = files.iter()
+                .filter(|p| p.file_name().unwrap().to_string_lossy().contains(hash))
+                .collect();
+            assert_eq!(paths.len(), 1, "{hash}: exactly one original fixture required");
+            let bytes = std::fs::read(paths[0]).unwrap();
+            let c = Container::parse(&bytes).unwrap();
+            let native = crate::native_programs(c.part(FourCC::DXIL).unwrap().data)
+                .unwrap()
+                .into_iter()
+                .find(|n| n.stage == HwStage::Cs)
+                .unwrap();
+            assert!(native.wave64, "{hash}");
+            let StageIo::Cs(cs) = native.io else { unreachable!() };
+            assert_eq!(cs.threads.iter().product::<u32>(), group, "{hash}");
+            let p = crate::spill::build(&native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            lower::TEST_HOST_WAVE.set(Some(32));
+            let (_, wave) = emit_with_fallbacks(&c, &native, &p, &st, &io, &res).unwrap();
+            if hash != "02384a60fda6f2d0" {
+                assert_eq!(wave, Some(32), "{hash}: exact wave32 retry");
+                let output = emit(&c, &native, &p, &st, &io, &res).unwrap();
+                #[cfg(windows)]
+                {
+                    let mut validator =
+                        validator::Validator::load(validator::Validator::default_path().as_deref())
+                            .expect("the fixture regression requires DXIL validator");
+                    validator.validate(&mut output.dxil.clone()).expect(hash);
+                }
+                #[cfg(not(windows))]
+                let _ = output;
+            } else {
+                assert_eq!(wave, Some(64), "{hash}: cross-wave loop remains unresolved");
+                assert!(
+                    matches!(emit(&c, &native, &p, &st, &io, &res),
+                        Err(ShaderError::Unsupported {
+                            what: "required wave size exceeds the host maximum", ..
+                        })),
+                    "{hash}"
+                );
+            }
+            lower::TEST_HOST_WAVE.set(Some(64));
+            let (expected, wave) = emit_program(&c, &native, &p, &st, &io, &res).unwrap();
+            assert_eq!(wave, Some(64), "{hash}");
+            assert_eq!(emit(&c, &native, &p, &st, &io, &res).unwrap(), expected, "{hash}");
+            #[cfg(windows)]
+            {
+                let mut validator =
+                    validator::Validator::load(validator::Validator::default_path().as_deref())
+                        .expect("the fixture regression requires the DXIL validator");
+                validator.validate(&mut expected.dxil.clone()).expect(hash);
+            }
+        }
+    }
+
+    /// The tiled cascaded-shadow shader must not be mistaken for a wave32
+    /// solution merely because its wave64 DXIL validates. The original
+    /// shader is supplied locally, not checked into the repository.
+    #[test]
+    #[ignore = "requires the original f133e35efed2a48a container in VICTORY_CASCADE_FIXTURE"]
+    fn original_cascade_shadow_distinguishes_wave32_from_wave64() {
+        assert_eq!(std::env::var("VICTORY_WAVE_LOCAL").as_deref(), Ok("idiom"));
+        assert_eq!(std::env::var("VICTORY_WAVE_WIDE").as_deref(), Ok("0"));
+        let bytes = std::fs::read(std::env::var_os("VICTORY_CASCADE_FIXTURE").unwrap()).unwrap();
+        let c = Container::parse(&bytes).unwrap();
+        let native = crate::native_programs(c.part(FourCC::DXIL).unwrap().data)
+            .unwrap()
+            .into_iter()
+            .find(|n| n.stage == HwStage::Cs)
+            .unwrap();
+        assert!(native.wave64);
+        let StageIo::Cs(cs) = native.io else { unreachable!() };
+        let p = crate::spill::build(&native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let offset = |site: resource::Site| p.blocks[site.0].insts[site.1].machine.offset;
+        let descriptor_origin = |at| {
+            let d = res
+                .descriptors
+                .iter()
+                .find(|d| resource::Role::Resource == d.role && offset(d.site) == at)
+                .unwrap_or_else(|| panic!("resource at {at:#x}"));
+            let resource::Source::Loaded { load, first } = d.source else {
+                panic!("expected a direct load at {at:#x}, got {:?}", d.source)
+            };
+            let (_, address) = res.scalar.iter().find(|&&(site, _)| site == load).unwrap();
+            (offset(load), first, *address)
+        };
+        let (descriptor_at, first, descriptor) = descriptor_origin(0xc4);
+        assert_eq!((descriptor_at, first, descriptor.offset), (0xb8, 0, 0x780));
+        for (at, load) in [(0x210, 0x1cc), (0x29558, 0x294f4), (0x2957c, 0x294f4)] {
+            assert_eq!(descriptor_origin(at), (load, first, descriptor));
+        }
+        let (_, first, dimensions) = descriptor_origin(0x10c);
+        assert_eq!(descriptor_origin(0x29510), (0x294fc, first, dimensions));
+        let instructions: std::collections::HashMap<_, _> = p.blocks.iter()
+            .flat_map(|b| &b.insts)
+            .map(|i| (i.machine.offset, i))
+            .collect();
+        let definitions: std::collections::HashMap<_, _> = p.blocks.iter()
+            .flat_map(|b| &b.insts)
+            .flat_map(|i| i.writes.iter().map(move |&(_, v)| (v, i)))
+            .collect();
+        let phis: std::collections::HashMap<_, _> = p.blocks.iter()
+            .flat_map(|b| &b.phis)
+            .map(|phi| (phi.value, &phi.args))
+            .collect();
+        for (reg, early, late) in [(84, 0x1e4, 0x29504), (104, 0x1f0, 0x29508)] {
+            let (early, late) = (instructions[&early], instructions[&late]);
+            let r = ir::Reg::S(reg);
+            let (early, late) = (early.read(r).unwrap(), late.read(r).unwrap());
+            let origin = |value| {
+                let mut pending = vec![value];
+                let mut seen = std::collections::HashSet::new();
+                let mut leaves = Vec::new();
+                while let Some(value) = pending.pop() {
+                    if seen.insert(value) {
+                        if let Some(args) = phis.get(&value) {
+                            pending.extend(args.iter().copied());
+                        } else if let Some(inst) = definitions.get(&value) {
+                            if let [(_, arg)] = inst.reads.as_slice()
+                                && inst.name() == "s_mov_b32"
+                            {
+                                pending.push(*arg);
+                            } else {
+                                leaves.push(value);
+                            }
+                        } else {
+                            panic!("unexpected live-in {value:?} in tile coordinate audit");
+                        }
+                    }
+                }
+                leaves.sort_unstable();
+                leaves.dedup();
+                leaves
+            };
+            assert_eq!(origin(early), vec![early], "s{reg} early coordinate");
+            assert_eq!(origin(late), vec![early], "s{reg} late coordinate");
+        }
+        let (group_ids, _) = cs.system_sgprs();
+        assert_eq!(group_ids, [Some(7), Some(8), None]);
+        assert!(cs.thread_id_vgprs() >= 2);
+        assert_eq!(cs.lds_bytes(), 0);
+        eprintln!("cascade shadow: group ID registers {group_ids:?}, indexed buffer {descriptor:?}, dimensions source {dimensions:?}");
+        let _restore = RestoreHost(lower::TEST_HOST_WAVE.replace(Some(32)));
+        assert!(matches!(
+            emit(&c, &native, &p, &st, &io, &res),
+            Err(ShaderError::Unsupported {
+                offset: 0x1eb4,
+                what: "a lane mask exchanged where not every lane runs",
+            })
+        ));
+        lower::TEST_HOST_WAVE.set(Some(64));
+        let (output, wave) = emit_with_fallbacks(&c, &native, &p, &st, &io, &res).unwrap();
+        assert_eq!(wave, Some(64));
+        eprintln!("cascade shadow native thread dimensions: {:?}", cs.threads);
+        #[cfg(windows)]
+        {
+            let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref())
+                .expect("the fixture regression requires DXIL validator");
+            validator.validate(&mut output.dxil.clone()).unwrap();
+        }
+        #[cfg(not(windows))]
+        let _ = output;
+    }
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
